@@ -1,0 +1,63 @@
+# === Python ===
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Cache công cụ test/lint
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Notebook
+.ipynb_checkpoints/
+
+# === Biến môi trường & secrets ===
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# === Dữ liệu lakehouse (tự sinh, không commit) ===
+data/raw/
+data/bronze/
+data/silver/
+data/gold/
+data/quarantine/
+data/quality/
+data/smoke/
+data/external/*
+!data/external/.gitkeep
+
+data/bad_data_samples/*.csv
+!data/bad_data_samples/.gitkeep
+
+# CSDL phân tích sinh ra khi build
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+
+# === Log & báo cáo tự sinh ===
+logs/
+*.log
+report/report_data.json
+report/*.pdf
+
+# === Hệ điều hành ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp

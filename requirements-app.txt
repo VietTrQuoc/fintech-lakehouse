@@ -1,0 +1,6 @@
+# Dependencies cho giao diện Streamlit (app/streamlit_app.py)
+# Cài:  .venv\Scripts\python -m pip install -r requirements-app.txt
+streamlit>=1.58
+plotly>=6.0
+duckdb>=1.5
+pandas>=2.2

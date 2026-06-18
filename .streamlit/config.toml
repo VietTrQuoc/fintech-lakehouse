@@ -1,0 +1,9 @@
+# Cấu hình Streamlit cho dự án — tắt lời nhắc email & telemetry, mở app gọn gàng.
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = false
+
+[theme]
+primaryColor = "#0b4f6c"

@@ -1,0 +1,65 @@
+{
+  "source": "paysim_calibrated",
+  "source_dataset": "ealaxi/paysim1",
+  "source_file": "data\\external\\paysim\\PS_20174392719_1491204439457_log.csv",
+  "generated_at": "2026-06-10T14:44:38.800684+00:00",
+  "amount_scale_factor": 20.0,
+  "notes": [
+    "PaySim is used only for transaction type ratios, amount log-normal parameters, and fraud rates.",
+    "PaySim amounts are multiplied by amount_scale_factor before fitting to reach a realistic VND magnitude while keeping the distribution shape.",
+    "The production generator lifts fraud_rate to 0.7 percent through config for a denser portfolio demo."
+  ],
+  "pay_sim_observed_fraud_rate": 0.00129082,
+  "demo_fraud_rate": 0.007,
+  "type_ratios": {
+    "payment": 0.33814608,
+    "transfer": 0.08375622,
+    "withdrawal": 0.35166331,
+    "topup": 0.21992261,
+    "debit": 0.00651178
+  },
+  "fraud_rate_by_type": {
+    "payment": 0.0,
+    "transfer": 0.00768799,
+    "withdrawal": 0.00183955,
+    "topup": 0.0,
+    "debit": 0.0
+  },
+  "amount_lognormal": {
+    "debit": {
+      "mu": 10.900768,
+      "sigma": 1.201596,
+      "cap_vnd": 3584168
+    },
+    "payment": {
+      "mu": 11.968131,
+      "sigma": 1.184834,
+      "cap_vnd": 1794028
+    },
+    "topup": {
+      "mu": 14.643535,
+      "sigma": 1.076588,
+      "cap_vnd": 14555827
+    },
+    "transfer": {
+      "mu": 15.965576,
+      "sigma": 1.300404,
+      "cap_vnd": 496810249
+    },
+    "withdrawal": {
+      "mu": 14.675281,
+      "sigma": 1.076981,
+      "cap_vnd": 17293528
+    }
+  },
+  "fraud_amount_lognormal": {
+    "transfer": {
+      "mu": 15.920044,
+      "sigma": 1.861425
+    },
+    "withdrawal": {
+      "mu": 15.843907,
+      "sigma": 2.101312
+    }
+  }
+}
