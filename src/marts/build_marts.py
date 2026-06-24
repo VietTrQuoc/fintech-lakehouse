@@ -1,11 +1,4 @@
-"""Day 10 — Build 4 mart cốt lõi từ Gold star schema.
-
-Chạy SQL `sql/marts/*.sql` (CREATE OR REPLACE TABLE mart_x AS ...) thẳng trên `data/gold/gold.duckdb`
-(đã có fact + 6 dim, FK-validated từ Day 9), rồi COPY mỗi mart ra `data/gold/marts/<mart>.parquet`.
-
-4 mart: daily_transaction, customer_risk, merchant_risk, fraud_features (cuối — nặng nhất).
-Chạy: python -m src.marts.build_marts
-"""
+"""Build 4 core data marts from Gold star schema via DuckDB SQL."""
 
 import json
 import logging
@@ -15,13 +8,9 @@ from pathlib import Path
 
 import duckdb
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # console Windows cp1252 -> tên tiếng Việt
+from src.paths import GOLD_DB, LOG_DIR, MARTS_OUT, MARTS_SQL
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GOLD_DB = PROJECT_ROOT / "data" / "gold" / "gold.duckdb"
-MARTS_SQL = PROJECT_ROOT / "sql" / "marts"
-MARTS_OUT = PROJECT_ROOT / "data" / "gold" / "marts"
-LOG_DIR = PROJECT_ROOT / "logs"
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -31,23 +20,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("marts")
 
-# fraud_features chạy CUỐI (nặng nhất). Tên file = tên mart table.
 MART_NAMES = ["mart_daily_transaction", "mart_customer_risk", "mart_merchant_risk", "mart_fraud_features"]
 
-# Kỳ vọng (đo thực trên gold.duckdb Day 9)
 FACT_ROWS = 1_976_026
 FRAUD_TOTAL = 14_000
-MERCHANT_TXN = 680_673          # fact - merchant_sk(-1) = 1,976,026 - 1,295,353
-FRAUD_FEATURES_ROWS = 1_973_027  # fact - 2,999 orphan customer
+MERCHANT_TXN = 680_673
+FRAUD_FEATURES_ROWS = 1_973_027
 
 
 def run_sql_file(con: duckdb.DuckDBPyConnection, path: Path) -> None:
-    """Chạy mọi statement trong 1 file .sql. Bỏ comment '--' trước khi tách theo ';'
-    (comment có thể chứa ';' — vd 'COUNT(DISTINCT) OVER; array_agg' — sẽ làm split sai)."""
+    """Execute all statements in a .sql file, stripping -- comments before splitting on ;."""
     lines = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if "--" in line:
-            line = line[: line.index("--")]  # cắt comment (không có '--' trong string literal ở mart)
+            line = line[: line.index("--")]
         lines.append(line)
     for stmt in (s.strip() for s in "\n".join(lines).split(";")):
         if stmt:

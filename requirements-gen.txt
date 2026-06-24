@@ -1,9 +1,10 @@
+# Core dependencies for data generation & ETL pipeline
+# Install: pip install -r requirements-gen.txt
 numpy>=2.0
 pandas>=2.2
 faker>=25.0
 pyarrow>=16.0
-kaggle>=1.6
-scipy>=1.13
-jupyter>=1.0
-matplotlib>=3.7
-seaborn>=0.12
+duckdb>=1.5
+
+# Optional: notebooks & calibration
+# pip install jupyter matplotlib seaborn scipy kaggle

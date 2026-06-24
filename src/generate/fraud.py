@@ -28,18 +28,17 @@ def inject_fraud(txn: Transactions, dims: Dimensions, cfg: GeneratorConfig, rng:
         cursor += count
         if count == 0:
             continue
-        if pattern == "velocity_burst":
-            _velocity_burst(txn, dims, rows, rng, fraud_params)
-        elif pattern == "amount_spike":
-            _amount_spike(txn, rows, rng, fraud_params)
-        elif pattern == "new_device_location":
-            _new_device_location(txn, dims, rows, rng, fraud_params)
-        elif pattern == "cross_country":
-            _cross_country(txn, dims, rows, rng, fraud_params)
-        elif pattern == "night_high_amount":
-            _night_high_amount(txn, rows, rng, fraud_params)
-        elif pattern == "card_testing":
-            _card_testing(txn, dims, rows, rng)
+        _FRAUD_DISPATCH = {
+            "velocity_burst":      lambda: _velocity_burst(txn, dims, rows, rng, fraud_params),
+            "amount_spike":        lambda: _amount_spike(txn, rows, rng, fraud_params),
+            "new_device_location": lambda: _new_device_location(txn, dims, rows, rng, fraud_params),
+            "cross_country":       lambda: _cross_country(txn, dims, rows, rng, fraud_params),
+            "night_high_amount":   lambda: _night_high_amount(txn, rows, rng, fraud_params),
+            "card_testing":        lambda: _card_testing(txn, dims, rows, rng),
+        }
+        handler = _FRAUD_DISPATCH.get(pattern)
+        if handler:
+            handler()
         for row in rows:
             txn.fraud_patterns[int(row)] = pattern
 
@@ -51,32 +50,12 @@ def write_fraud_labels(txn: Transactions, cfg: GeneratorConfig) -> dict[str, int
     path.parent.mkdir(parents=True, exist_ok=True)
     fraud_count = len(txn.fraud_patterns)
     total_rows = txn.n if cfg.label_all_transactions else fraud_count
+    rows_iter = ((i, txn.fraud_patterns.get(i, "")) for i in range(txn.n)) if cfg.label_all_transactions else sorted(txn.fraud_patterns.items())
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(FRAUD_LABEL_FIELDS)
-        if cfg.label_all_transactions:
-            for row_idx in range(txn.n):
-                pattern = txn.fraud_patterns.get(row_idx, "")
-                writer.writerow(
-                    [
-                        transaction_id_for_row(txn, row_idx),
-                        1 if pattern else 0,
-                        pattern,
-                        "synthetic_rule_engine",
-                        str(txn.ingestion_time[row_idx].astype("datetime64[s]")),
-                    ]
-                )
-        else:
-            for row_idx, pattern in sorted(txn.fraud_patterns.items()):
-                writer.writerow(
-                    [
-                        transaction_id_for_row(txn, row_idx),
-                        1,
-                        pattern,
-                        "synthetic_rule_engine",
-                        str(txn.ingestion_time[row_idx].astype("datetime64[s]")),
-                    ]
-                )
+        for row_idx, pattern in rows_iter:
+            writer.writerow([transaction_id_for_row(txn, row_idx), 1 if pattern else 0, pattern, "synthetic_rule_engine", str(txn.ingestion_time[row_idx].astype("datetime64[s]"))])
     return {"fraud_label_rows": total_rows, "fraud_positive_rows": fraud_count}
 
 
@@ -101,6 +80,12 @@ def _set_customer_context(txn: Transactions, dims: Dimensions, rows: np.ndarray,
 def _set_ingestion_after_event(txn: Transactions, rows: np.ndarray, rng: np.random.Generator) -> None:
     lags = rng.integers(30, 1_800, size=len(rows)).astype("timedelta64[s]")
     txn.ingestion_time[rows] = txn.transaction_time[rows] + lags
+
+
+def _fraud_vnd_finish(txn: Transactions, rows: np.ndarray, rng: np.random.Generator) -> None:
+    """Set VND currency + ingestion lag — common tail for all fraud patterns."""
+    txn.currency_idx[rows] = CURRENCIES.index("VND")
+    _set_ingestion_after_event(txn, rows, rng)
 
 
 def _fraud_amount_floor(type_idx: np.ndarray, fraud_params: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
@@ -140,13 +125,11 @@ def _velocity_burst(txn: Transactions, dims: Dimensions, rows: np.ndarray, rng: 
             p=[0.65, 0.35],
         )
         txn.channel_idx[group] = CHANNELS.index("mobile")
-        txn.currency_idx[group] = CURRENCIES.index("VND")
         txn.amount[group] = np.maximum(txn.amount[group] * rng.uniform(3.0, 7.0, size=len(group)), _fraud_amount_floor(txn.type_idx[group], fraud_params, rng))
-        _set_ingestion_after_event(txn, group, rng)
+        _fraud_vnd_finish(txn, group, rng)
 
 
 def _amount_spike(txn: Transactions, rows: np.ndarray, rng: np.random.Generator, fraud_params: dict[str, Any]) -> None:
-    txn.currency_idx[rows] = CURRENCIES.index("VND")
     txn.type_idx[rows] = rng.choice(
         [TRANSACTION_TYPES.index("transfer"), TRANSACTION_TYPES.index("withdrawal"), TRANSACTION_TYPES.index("payment")],
         size=len(rows),
@@ -154,18 +137,17 @@ def _amount_spike(txn: Transactions, rows: np.ndarray, rng: np.random.Generator,
     )
     txn.amount[rows] = np.maximum(txn.amount[rows] * rng.uniform(9.0, 24.0, size=len(rows)), _fraud_amount_floor(txn.type_idx[rows], fraud_params, rng))
     txn.amount[rows] = np.minimum(txn.amount[rows], 400_000_000)
-    _set_ingestion_after_event(txn, rows, rng)
+    _fraud_vnd_finish(txn, rows, rng)
 
 
 def _new_device_location(txn: Transactions, dims: Dimensions, rows: np.ndarray, rng: np.random.Generator, fraud_params: dict[str, Any]) -> None:
     foreign_start = max(0, len(dims.locations) - 5)
     txn.device_idx[rows] = rng.integers(0, len(dims.devices), size=len(rows))
     txn.location_idx[rows] = rng.integers(foreign_start, len(dims.locations), size=len(rows))
-    txn.currency_idx[rows] = CURRENCIES.index("VND")
     txn.channel_idx[rows] = rng.choice([CHANNELS.index("mobile"), CHANNELS.index("web")], size=len(rows), p=[0.82, 0.18])
     txn.type_idx[rows] = rng.choice([TRANSACTION_TYPES.index("transfer"), TRANSACTION_TYPES.index("payment")], size=len(rows), p=[0.58, 0.42])
     txn.amount[rows] = np.maximum(txn.amount[rows] * rng.uniform(4.0, 12.0, size=len(rows)), _fraud_amount_floor(txn.type_idx[rows], fraud_params, rng))
-    _set_ingestion_after_event(txn, rows, rng)
+    _fraud_vnd_finish(txn, rows, rng)
 
 
 def _cross_country(txn: Transactions, dims: Dimensions, rows: np.ndarray, rng: np.random.Generator, fraud_params: dict[str, Any]) -> None:
@@ -185,22 +167,20 @@ def _cross_country(txn: Transactions, dims: Dimensions, rows: np.ndarray, rng: n
             txn.location_idx[group[1:]] = rng.integers(foreign_start, len(dims.locations), size=len(group) - 1)
             offsets = np.linspace(0, 2_400, len(group)).astype(np.int64).astype("timedelta64[s]")
             txn.transaction_time[group] = base + offsets
-        txn.currency_idx[group] = CURRENCIES.index("VND")
         txn.channel_idx[group] = CHANNELS.index("mobile")
         txn.type_idx[group] = rng.choice([TRANSACTION_TYPES.index("transfer"), TRANSACTION_TYPES.index("payment")], size=len(group), p=[0.62, 0.38])
         txn.amount[group] = np.maximum(txn.amount[group] * rng.uniform(3.0, 9.0, size=len(group)), _fraud_amount_floor(txn.type_idx[group], fraud_params, rng))
-        _set_ingestion_after_event(txn, group, rng)
+        _fraud_vnd_finish(txn, group, rng)
 
 
 def _night_high_amount(txn: Transactions, rows: np.ndarray, rng: np.random.Generator, fraud_params: dict[str, Any]) -> None:
     days = txn.transaction_time[rows].astype("datetime64[D]")
     seconds = rng.integers(2 * 3_600, 4 * 3_600 + 1_800, size=len(rows)).astype("timedelta64[s]")
     txn.transaction_time[rows] = days + seconds
-    txn.currency_idx[rows] = CURRENCIES.index("VND")
     txn.channel_idx[rows] = rng.choice([CHANNELS.index("mobile"), CHANNELS.index("web")], size=len(rows), p=[0.72, 0.28])
     txn.type_idx[rows] = rng.choice([TRANSACTION_TYPES.index("transfer"), TRANSACTION_TYPES.index("withdrawal")], size=len(rows), p=[0.72, 0.28])
     txn.amount[rows] = np.maximum(txn.amount[rows] * rng.uniform(6.0, 18.0, size=len(rows)), _fraud_amount_floor(txn.type_idx[rows], fraud_params, rng))
-    _set_ingestion_after_event(txn, rows, rng)
+    _fraud_vnd_finish(txn, rows, rng)
 
 
 def _card_testing(txn: Transactions, dims: Dimensions, rows: np.ndarray, rng: np.random.Generator) -> None:
@@ -216,11 +196,10 @@ def _card_testing(txn: Transactions, dims: Dimensions, rows: np.ndarray, rng: np
         txn.merchant_idx[group] = merchant_idx
         txn.type_idx[group] = TRANSACTION_TYPES.index("payment")
         txn.channel_idx[group] = rng.choice([CHANNELS.index("pos"), CHANNELS.index("web")], size=len(group), p=[0.35, 0.65])
-        txn.currency_idx[group] = CURRENCIES.index("VND")
         txn.amount[group] = rng.uniform(5_000, 95_000, size=len(group))
         txn.status_idx[group] = STATUSES.index("failed")
         txn.status_idx[group[-1]] = STATUSES.index("success")
         base_minute = txn.transaction_time[int(group[0])].astype("datetime64[m]")
         offsets = np.sort(rng.integers(0, 1_500, size=len(group))).astype("timedelta64[s]")
         txn.transaction_time[group] = base_minute + offsets
-        _set_ingestion_after_event(txn, group, rng)
+        _fraud_vnd_finish(txn, group, rng)

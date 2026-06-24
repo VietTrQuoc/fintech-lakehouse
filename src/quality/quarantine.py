@@ -1,36 +1,19 @@
-"""Day 8 — Quarantine split (tách dòng từ Silver).
-
-Day 6 gắn cờ, Day 7 báo cáo. Day 8 THỰC SỰ tách dòng: Silver (có `_dq_bucket`/`_is_valid`) ->
-  (1) clean (valid, fact-ready)  -> data/silver/clean_transactions/
-  (2) quarantine theo bucket + lý do -> data/quarantine/<bucket>/
-
-Routing CHỈ theo `_dq_bucket` / `_is_valid` đã có (single source of truth = Day 6), KHÔNG re-compute rule.
-Orphan FK là SOFT (`_is_valid=True`) -> đi vào clean (mang theo cờ `_dq_fk_*` cho Day 9 map Unknown sk=-1).
-
-Entrypoint: run_quarantine_split() (Airflow). CLI: python -m src.quality.quarantine (-> exit 0/1).
-"""
+"""Quarantine split: route Silver rows → clean or quarantine buckets."""
 
 import json
 import logging
 import shutil
 from collections import Counter
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import pyarrow.parquet as pq
 
-# Đường dẫn tuyệt đối theo vị trí file (parents[2] = src/quality/x.py -> src/quality -> src -> root).
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SILVER_DIR = PROJECT_ROOT / "data" / "silver"
-CLEAN_DIR = SILVER_DIR / "clean_transactions"          # đích clean (vẫn thuộc Silver, đã tách dòng hỏng)
-QUARANTINE_DIR = PROJECT_ROOT / "data" / "quarantine"  # đích quarantine (bad rows theo bucket)
-QUALITY_REPORT = PROJECT_ROOT / "data" / "quality" / "quality_report.json"  # để đối chiếu số Day 7
-LOG_DIR = PROJECT_ROOT / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+from src.paths import CLEAN_DIR, LOG_DIR, QUALITY_DIR, QUARANTINE_DIR, SILVER_DIR
 
-# Logging ra console + file (giống các module trước) -> theo dõi lúc chạy + lưu audit.
+QUALITY_REPORT = QUALITY_DIR / "quality_report.json"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -41,7 +24,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("quarantine")
 
-# 4 bucket = đúng giá trị domain của cột `_dq_bucket` (Day 6 đặt) + khớp tên trong architecture PDF.
 BUCKETS = [
     "quarantine_invalid_amount",
     "quarantine_invalid_timestamp",
@@ -49,9 +31,7 @@ BUCKETS = [
     "quarantine_bad_records",
 ]
 
-# 28 cột giữ ở clean = 24 nghiệp vụ/derived + 3 cờ SOFT FK + lineage. CỐ Ý BỎ các cờ hard/_dq_bucket/
-# _dq_errors/_is_valid/_is_duplicate_survivor: ở tập valid chúng toàn False/rỗng -> chỉ là nhiễu.
-# GIỮ 3 cờ `_dq_fk_*` vì orphan vẫn nằm trong clean (soft) và Day 9 cần biết để trỏ Unknown member sk=-1.
+# 28 cols = 24 business/derived + 3 SOFT FK flags + lineage. Omit hard DQ flags (all False in valid).
 CLEAN_KEEP_COLS = [
     "transaction_id", "customer_id", "account_id", "merchant_id", "device_id", "card_id",
     "transaction_type", "channel", "status", "currency",
@@ -64,15 +44,11 @@ CLEAN_KEEP_COLS = [
 
 
 def make_run_id() -> str:
-    """1 id cho mỗi lần split (vd 'quarantine_20260616_...') -> đóng dấu vào quarantine_run_id."""
     return "quarantine_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def reset_output_dirs() -> None:
-    """rmtree + mkdir cả clean lẫn quarantine TRƯỚC khi ghi -> re-run xác định, không sót file cũ.
-
-    Nếu chỉ ghi đè theo tên, file tháng/bucket của lần trước có thể còn sót -> output không khớp input.
-    """
+    """Remove + recreate clean and quarantine dirs for idempotent re-runs."""
     for d in (CLEAN_DIR, QUARANTINE_DIR):
         if d.exists():
             shutil.rmtree(d)
@@ -80,45 +56,39 @@ def reset_output_dirs() -> None:
 
 
 def split_partition(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
-    """1 partition Silver -> (clean_df, {bucket: rows_df}). Thuần DataFrame->DataFrame (test + Day 15 port).
-
-    Tiêu chí DUY NHẤT: `_is_valid` (clean) và `_dq_bucket` (bucket).
-    ⚠️ KHÔNG dựa "bất kỳ cờ _dq_* nào bật" -> vì orphan FK soft cũng bật cờ nhưng `_is_valid=True`,
-    nó PHẢI vào clean (không quarantine). Chỉ `_is_valid`/`_dq_bucket` mới quyết định đi đâu.
-    """
-    clean_df = df.loc[df["_is_valid"], CLEAN_KEEP_COLS].copy()              # valid -> clean (chỉ giữ 28 cột)
-    bucket_frames = {b: df.loc[df["_dq_bucket"] == b].copy() for b in BUCKETS}  # mỗi bucket lấy dòng của nó
+    """Split one Silver partition → (clean_df, {bucket: rows_df}). Routes by _is_valid/_dq_bucket only."""
+    clean_df = df.loc[df["_is_valid"], CLEAN_KEEP_COLS].copy()
+    bucket_frames = {b: df.loc[df["_dq_bucket"] == b].copy() for b in BUCKETS}
     return clean_df, bucket_frames
 
 
 def build_quarantine_frame(df: pd.DataFrame, run_id: str) -> pd.DataFrame:
-    """Thêm cột lý do/lineage rõ ràng cho người điều tra (đặt lên ĐẦU bảng), giữ full cột gốc để audit."""
+    """Add reason/lineage columns at front for auditability."""
     out = df.copy()
-    out["quarantine_reason"] = out["_dq_errors"]      # bản sao _dq_errors -> đáp PDF "lưu lý do lỗi"
-    out["quarantine_bucket"] = out["_dq_bucket"]      # bucket dòng này thuộc về (khi gộp file vẫn biết)
-    out["quarantined_at"] = datetime.now(timezone.utc).isoformat()  # lúc split
-    out["quarantine_run_id"] = run_id                 # lineage của chính bước quarantine
+    out["quarantine_reason"] = out["_dq_errors"]
+    out["quarantine_bucket"] = out["_dq_bucket"]
+    out["quarantined_at"] = datetime.now(timezone.utc).isoformat()
+    out["quarantine_run_id"] = run_id
     lead = ["quarantine_bucket", "quarantine_reason", "quarantined_at", "quarantine_run_id"]
-    return out[lead + [c for c in out.columns if c not in lead]]  # đưa 4 cột mới lên đầu
+    return out[lead + [c for c in out.columns if c not in lead]]
 
 
 def run_quarantine_split() -> dict:
-    """Điều phối: reset -> xử từng partition tháng -> ghi clean ngay + gom quarantine -> verify -> summary."""
+    """Orchestrate: reset → process each partition → write clean + accumulate quarantine → verify."""
     run_id = make_run_id()
     log.info("quarantine split start run_id=%s", run_id)
     reset_output_dirs()
 
     parts = sorted((SILVER_DIR / "transactions").glob("silver_transactions_*.parquet"))
     clean_counts: dict[str, int] = {}
-    # Quarantine gom across-month (1 file/bucket), nên trong vòng lặp chỉ TÍCH LŨY list theo bucket,
-    # sau vòng lặp mới concat + ghi 1 lần. clean thì ghi ngay theo từng tháng (giữ partition).
+    # Accumulate quarantine across months (1 file/bucket), write clean immediately per month.
     bucket_acc: dict[str, list[pd.DataFrame]] = {b: [] for b in BUCKETS}
     silver_cols: list[str] = []
 
     for p in parts:
         month = p.stem.replace("silver_transactions_", "")
-        df = pd.read_parquet(p)              # đọc FULL cột (quarantine cần đủ ngữ cảnh để audit)
-        silver_cols = list(df.columns)       # nhớ schema để tạo file rỗng-có-schema nếu bucket trống
+        df = pd.read_parquet(p)
+        silver_cols = list(df.columns)
         clean_df, bucket_frames = split_partition(df)
         clean_df.to_parquet(CLEAN_DIR / f"clean_transactions_{month}.parquet", index=False)
         clean_counts[month] = len(clean_df)
@@ -129,7 +99,7 @@ def run_quarantine_split() -> dict:
                 quarantined += len(sub)
         log.info("clean_transactions[%s] rows=%7d clean=%7d quarantined=%6d", month, len(df), len(clean_df), quarantined)
 
-    # Ghi 1 file/bucket. Bucket rỗng -> vẫn ghi file rỗng-CÓ-SCHEMA để Day 9/15 glob luôn tìm thấy dataset.
+    # Write 1 file/bucket. Empty buckets still get a schema-only file so glob always finds the dataset.
     quarantine_counts: dict[str, int] = {}
     empty_cols = ["quarantine_bucket", "quarantine_reason", "quarantined_at", "quarantine_run_id"] + silver_cols
     for b in BUCKETS:
@@ -153,7 +123,7 @@ def run_quarantine_split() -> dict:
 
 
 def _build_summary(run_id: str, clean_counts: dict, quarantine_counts: dict) -> dict:
-    """Gom số liệu tổng. silver_total đếm qua metadata parquet (không load lại data)."""
+    """Aggregate counts. silver_total via metadata (zero-data read)."""
     silver_total = sum(pq.read_metadata(p).num_rows for p in (SILVER_DIR / "transactions").glob("silver_transactions_*.parquet"))
     clean_total = sum(clean_counts.values())
     q_total = sum(quarantine_counts.values())
@@ -172,10 +142,7 @@ def _build_summary(run_id: str, clean_counts: dict, quarantine_counts: dict) -> 
 
 
 def verify(summary: dict) -> list[dict]:
-    """Các kiểm tra SAU split (đọc lại output đã ghi). Trả về list {name, passed, detail}.
-
-    Bất kỳ check nào fail -> overall_passed=False -> main() exit 1 (Airflow Day 13 sẽ fail task).
-    """
+    """Post-split checks: conservation, reconciliation, purity, uniqueness."""
     checks: list[dict] = []
 
     def add(name: str, passed: bool, detail: Any) -> None:

@@ -57,26 +57,21 @@ def inject_errors(
         pool = np.setdiff1d(pool, rows, assume_unique=True)
         originals = {int(row): transaction_id_for_row(txn, int(row)) for row in rows}
 
-        if error_type == "null_transaction_id":
-            _null_transaction_id(txn, rows, originals, manifest)
-        elif error_type == "duplicate_transaction_id":
-            _duplicate_transaction_id(txn, rows, originals, manifest, rng)
-        elif error_type == "invalid_amount":
-            _invalid_amount(txn, rows, originals, manifest)
-        elif error_type == "invalid_timestamp":
-            _invalid_timestamp(txn, rows, originals, manifest)
-        elif error_type == "orphan_customer":
-            _orphan_customer(txn, dims, rows, originals, manifest)
-        elif error_type == "orphan_account":
-            _orphan_account(txn, dims, rows, originals, manifest)
-        elif error_type == "orphan_merchant":
-            _orphan_merchant(txn, dims, rows, originals, manifest)
-        elif error_type == "invalid_currency":
-            _invalid_currency(txn, rows, originals, manifest)
-        elif error_type == "invalid_channel":
-            _invalid_channel(txn, rows, originals, manifest)
-        elif error_type == "invalid_location":
-            _invalid_location(txn, rows, originals, manifest)
+        _DISPATCH = {
+            "null_transaction_id":      lambda: _null_transaction_id(txn, rows, originals, manifest),
+            "duplicate_transaction_id": lambda: _duplicate_transaction_id(txn, rows, originals, manifest, rng),
+            "invalid_amount":           lambda: _invalid_amount(txn, rows, originals, manifest),
+            "invalid_timestamp":        lambda: _invalid_timestamp(txn, rows, originals, manifest),
+            "orphan_customer":          lambda: _orphan_customer(txn, dims, rows, originals, manifest),
+            "orphan_account":           lambda: _orphan_account(txn, dims, rows, originals, manifest),
+            "orphan_merchant":          lambda: _orphan_merchant(txn, dims, rows, originals, manifest),
+            "invalid_currency":         lambda: _invalid_currency(txn, rows, originals, manifest),
+            "invalid_channel":          lambda: _invalid_channel(txn, rows, originals, manifest),
+            "invalid_location":         lambda: _invalid_location(txn, rows, originals, manifest),
+        }
+        handler = _DISPATCH.get(error_type)
+        if handler:
+            handler()
 
     manifest.sort(key=lambda row: int(row["row_index"]))
     return manifest

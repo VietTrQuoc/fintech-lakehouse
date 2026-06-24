@@ -1,15 +1,4 @@
-"""Day 7 — Data Quality checks + report (chạy trên Silver).
-
-Day 6 đã gắn cờ `_dq_*` per-row. Day 7 KHÔNG tính lại rule — mà tổng hợp cờ thành các CHECK cấp bảng
-(tên + ngưỡng + severity + pass/fail), cộng vài check toàn vẹn độc lập, rồi xuất report. Chỉ ĐỌC +
-BÁO CÁO; split -> quarantine là Day 8.
-
-Severity:
-- WARNING = bad-data-row (nguồn bẩn, đã biết, Day 8 quarantine xử) -> KHÔNG fail pipeline (khớp Day 13).
-- ERROR   = lỗi cấu trúc/transform (mất dòng, sai schema, survivor sai, measure rỗng) -> fail pipeline.
-
-Entrypoint: run_quality_checks() (Airflow gọi). CLI: python -m src.quality.quality_checks (-> exit 0/1).
-"""
+"""Data Quality checks: aggregate Silver DQ flags → table-level checks + report."""
 
 import argparse
 import json
@@ -24,14 +13,8 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from src.generate.config import GeneratorConfig
+from src.paths import BAD_DATA_DIR, BRONZE_DIR, DOCS_DIR, LOG_DIR, QUALITY_DIR, SILVER_DIR
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-BRONZE_DIR = PROJECT_ROOT / "data" / "bronze"
-SILVER_DIR = PROJECT_ROOT / "data" / "silver"
-QUALITY_DIR = PROJECT_ROOT / "data" / "quality"
-DOCS_DIR = PROJECT_ROOT / "docs"
-BAD_DATA_DIR = PROJECT_ROOT / "data" / "bad_data_samples"
-LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -47,8 +30,7 @@ log = logging.getLogger("quality")
 SEVERITY_ERROR = "ERROR"
 SEVERITY_WARNING = "WARNING"
 
-# Nhóm A (row-flag aggregation): cờ Silver -> (tên check, ngưỡng rate tối đa). Tất cả WARNING, so "<=".
-# Ngưỡng ~ 2-3x expected từ config.error_rates (buffer dao động seed/tháng).
+# Row-flag → (check name, max rate). Thresholds ~2-3x expected from config.error_rates.
 RULE_THRESHOLDS: dict[str, tuple[str, float]] = {
     "_dq_null_transaction_id": ("null_transaction_id", 0.003),
     "_dq_invalid_amount": ("invalid_amount", 0.010),
@@ -64,14 +46,12 @@ RULE_THRESHOLDS: dict[str, tuple[str, float]] = {
     "_dq_fk_merchant": ("fk_merchant_orphan", 0.010),  # SOFT
 }
 
-# Cột cần có trong Silver (check schema_conformance). Thiếu/sai -> ERROR.
 REQUIRED_COLUMNS = [
     "transaction_id", "amount_original", "amount_vnd", "exchange_rate", "event_time", "event_date",
     "source_row_number", "_dq_errors", "_dq_bucket", "_is_valid", "_is_duplicate_survivor", "_dq_run_id",
     *RULE_THRESHOLDS.keys(),
 ]
 
-# error_type trong manifest -> cờ Silver tương ứng (cho reconciliation).
 MANIFEST_FLAG_MAP = {
     "null_transaction_id": "_dq_null_transaction_id",
     "invalid_amount": "_dq_invalid_amount",
@@ -99,25 +79,19 @@ class Check:
     detail: dict = field(default_factory=dict)
 
 
-def _evaluate(observed: float, comparator: str, threshold: float) -> bool:
-    if comparator == "<=":
-        return observed <= threshold
-    if comparator == ">=":
-        return observed >= threshold
-    if comparator == "==":
-        return observed == threshold
-    raise ValueError(f"comparator lạ: {comparator}")
+_EVAL = {"<=": lambda o, t: o <= t, ">=": lambda o, t: o >= t, "==": lambda o, t: o == t}
+
+
+def _make_check(name: str, group: str, severity: str, desc: str, observed: float, threshold: float, comparator: str, detail: dict | None = None) -> Check:
+    return Check(name, group, severity, desc, round(observed, 6), threshold, comparator, _EVAL[comparator](observed, threshold), detail or {})
 
 
 def make_run_id() -> str:
     return "quality_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-# ----------------------------------------------------------------------------
-# Load
-# ----------------------------------------------------------------------------
 def load_silver_transactions() -> pd.DataFrame:
-    """Đọc 7 partition Silver (chỉ cột cần) + gắn _partition_month từ tên file (đáng tin hơn event_date)."""
+    """Read 7 Silver partitions (needed columns only) + attach _partition_month from filename."""
     parts = sorted((SILVER_DIR / "transactions").glob("silver_transactions_*.parquet"))
     cols = [
         "transaction_id", "customer_id", "account_id", "source_row_number",
@@ -134,146 +108,64 @@ def load_silver_transactions() -> pd.DataFrame:
 
 
 def partition_rowcounts(directory: Path, pattern: str) -> dict[str, int]:
-    """Đếm số dòng mỗi partition qua metadata parquet (KHÔNG load data)."""
+    """Count rows per partition via Parquet metadata (zero-data read)."""
     out = {}
     for p in sorted(directory.glob(pattern)):
         out[p.stem] = pq.read_metadata(p).num_rows
     return out
 
 
-# ----------------------------------------------------------------------------
-# Nhóm A — row-flag aggregation (WARNING)
-# ----------------------------------------------------------------------------
+# -- Row-flag checks (WARNING) --
 def build_row_flag_checks(df: pd.DataFrame) -> list[Check]:
     n = len(df)
     checks: list[Check] = []
     for flag, (name, threshold) in RULE_THRESHOLDS.items():
         failing = int(df[flag].sum())
         rate = failing / n
-        by_month = (df.groupby("_partition_month")[flag].mean()).round(6).to_dict()
-        checks.append(
-            Check(
-                name=f"rate_{name}",
-                group="row_flag",
-                severity=SEVERITY_WARNING,
-                description=f"Tỷ lệ dòng dính {name} (cờ {flag})",
-                observed=round(rate, 6),
-                threshold=threshold,
-                comparator="<=",
-                passed=_evaluate(rate, "<=", threshold),
-                detail={"failing": failing, "total": n, "by_month": by_month},
-            )
-        )
+        checks.append(_make_check(f"rate_{name}", "row_flag", SEVERITY_WARNING,
+            f"Rate of {name}", rate, threshold, "<=",
+            {"failing": failing, "total": n, "by_month": (df.groupby("_partition_month")[flag].mean()).round(6).to_dict()}))
     valid_rate = float(df["_is_valid"].mean())
-    checks.append(
-        Check(
-            name="valid_rate",
-            group="row_flag",
-            severity=SEVERITY_WARNING,
-            description="Tỷ lệ dòng hợp lệ (không lỗi cứng)",
-            observed=round(valid_rate, 6),
-            threshold=0.95,
-            comparator=">=",
-            passed=_evaluate(valid_rate, ">=", 0.95),
-            detail={"valid_rows": int(df["_is_valid"].sum()), "total": n},
-        )
-    )
+    checks.append(_make_check("valid_rate", "row_flag", SEVERITY_WARNING,
+        "Valid row rate", valid_rate, 0.95, ">=",
+        {"valid_rows": int(df["_is_valid"].sum()), "total": n}))
     return checks
 
 
-# ----------------------------------------------------------------------------
-# Nhóm B — table-level integrity (ERROR)
-# ----------------------------------------------------------------------------
+# -- Table-level integrity checks (ERROR) --
 def build_integrity_checks(df: pd.DataFrame, bronze_counts: dict, silver_counts: dict, schema_names: set[str], cfg: GeneratorConfig) -> list[Check]:
     n = len(df)
-    checks: list[Check] = []
+    c: list[Check] = []
+    _add = lambda name, obs, thr, comp, detail: c.append(_make_check(name, "integrity", SEVERITY_ERROR, "", obs, thr, comp, detail))
 
-    # 1. rowcount Silver == Bronze (cast-and-flag giữ mọi dòng)
     bronze_total = sum(bronze_counts.values())
     silver_total = sum(silver_counts.values())
-    checks.append(Check(
-        name="rowcount_silver_eq_bronze", group="integrity", severity=SEVERITY_ERROR,
-        description="Silver giữ đúng số dòng Bronze (không mất/nhân dòng)",
-        observed=abs(silver_total - bronze_total), threshold=0, comparator="==",
-        passed=(silver_total == bronze_total),
-        detail={"bronze_total": bronze_total, "silver_total": silver_total},
-    ))
+    _add("rowcount_silver_eq_bronze", abs(silver_total - bronze_total), 0, "==", {"bronze_total": bronze_total, "silver_total": silver_total})
 
-    # 2. schema conformance: đủ cột bắt buộc
-    missing = [c for c in REQUIRED_COLUMNS if c not in schema_names]
-    checks.append(Check(
-        name="schema_conformance", group="integrity", severity=SEVERITY_ERROR,
-        description="Silver có đủ cột nghiệp vụ + cờ DQ",
-        observed=len(missing), threshold=0, comparator="==", passed=(len(missing) == 0),
-        detail={"missing_columns": missing},
-    ))
+    missing = [col for col in REQUIRED_COLUMNS if col not in schema_names]
+    _add("schema_conformance", len(missing), 0, "==", {"missing_columns": missing})
 
-    # 3. amount_vnd not-null khi _is_valid
-    bad_vnd = int((df["_is_valid"] & df["amount_vnd"].isna()).sum())
-    checks.append(Check(
-        name="amount_vnd_notnull_when_valid", group="integrity", severity=SEVERITY_ERROR,
-        description="Mọi dòng hợp lệ phải có amount_vnd (measure chính)",
-        observed=bad_vnd, threshold=0, comparator="==", passed=(bad_vnd == 0),
-        detail={"violations": bad_vnd},
-    ))
+    _add("amount_vnd_notnull_when_valid", int((df["_is_valid"] & df["amount_vnd"].isna()).sum()), 0, "==", {})
+    _add("exchange_rate_notnull_when_valid", int((df["_is_valid"] & df["exchange_rate"].isna()).sum()), 0, "==", {})
 
-    # 4. exchange_rate not-null khi _is_valid
-    bad_rate = int((df["_is_valid"] & df["exchange_rate"].isna()).sum())
-    checks.append(Check(
-        name="exchange_rate_notnull_when_valid", group="integrity", severity=SEVERITY_ERROR,
-        description="Mọi dòng hợp lệ phải khớp tỷ giá",
-        observed=bad_rate, threshold=0, comparator="==", passed=(bad_rate == 0),
-        detail={"violations": bad_rate},
-    ))
-
-    # 5. exactly one survivor per duplicate group
     dup_members = df[df["_dq_duplicate"] | df["_is_duplicate_survivor"]]
     surv_per_group = dup_members.groupby("transaction_id")["_is_duplicate_survivor"].sum()
     bad_groups = int((surv_per_group != 1).sum())
-    checks.append(Check(
-        name="exactly_one_survivor_per_group", group="integrity", severity=SEVERITY_ERROR,
-        description="Mỗi nhóm transaction_id trùng có đúng 1 survivor",
-        observed=bad_groups, threshold=0, comparator="==", passed=(bad_groups == 0),
-        detail={"dup_groups": int(len(surv_per_group)), "violating_groups": bad_groups},
-    ))
+    _add("exactly_one_survivor_per_group", bad_groups, 0, "==", {"dup_groups": int(len(surv_per_group)), "violating_groups": bad_groups})
 
-    # 6. no duplicate transaction_id trong tập valid
     valid_ids = df.loc[df["_is_valid"] & (df["transaction_id"] != ""), "transaction_id"]
-    dup_in_valid = int((valid_ids.value_counts() > 1).sum())
-    checks.append(Check(
-        name="no_dup_among_valid", group="integrity", severity=SEVERITY_ERROR,
-        description="transaction_id trong tập hợp lệ phải duy nhất",
-        observed=dup_in_valid, threshold=0, comparator="==", passed=(dup_in_valid == 0),
-        detail={"duplicated_ids": dup_in_valid},
-    ))
+    _add("no_dup_among_valid", int((valid_ids.value_counts() > 1).sum()), 0, "==", {})
 
-    # 7. bucket consistency: _is_valid <=> _dq_bucket == ""
     empty_bucket = df["_dq_bucket"].fillna("") == ""
-    mismatch = int(((df["_is_valid"] & ~empty_bucket) | (~df["_is_valid"] & empty_bucket)).sum())
-    checks.append(Check(
-        name="bucket_consistency", group="integrity", severity=SEVERITY_ERROR,
-        description="_is_valid khớp với _dq_bucket rỗng/không rỗng",
-        observed=mismatch, threshold=0, comparator="==", passed=(mismatch == 0),
-        detail={"mismatches": mismatch},
-    ))
+    _add("bucket_consistency", int(((df["_is_valid"] & ~empty_bucket) | (~df["_is_valid"] & empty_bucket)).sum()), 0, "==", {})
 
-    # 8. event_date trong window (chỉ dòng valid)
-    start = pd.Timestamp(cfg.date_start)
-    end = pd.Timestamp(cfg.date_end)
+    start, end = pd.Timestamp(cfg.date_start), pd.Timestamp(cfg.date_end)
     ed = pd.to_datetime(df["event_date"], errors="coerce")
-    out_window = int((df["_is_valid"] & (ed.isna() | (ed < start) | (ed > end))).sum())
-    checks.append(Check(
-        name="event_date_in_window", group="integrity", severity=SEVERITY_ERROR,
-        description=f"event_date của dòng hợp lệ trong [{cfg.date_start}, {cfg.date_end}]",
-        observed=out_window, threshold=0, comparator="==", passed=(out_window == 0),
-        detail={"out_of_window": out_window},
-    ))
-    return checks
+    _add("event_date_in_window", int((df["_is_valid"] & (ed.isna() | (ed < start) | (ed > end))).sum()), 0, "==", {})
+    return c
 
 
-# ----------------------------------------------------------------------------
-# Nhóm F — manifest reconciliation (WARNING)
-# ----------------------------------------------------------------------------
+# -- Manifest reconciliation (WARNING) --
 def reconcile_manifest(df: pd.DataFrame) -> tuple[Check, list[dict]]:
     path = BAD_DATA_DIR / "error_manifest.csv"
     if not path.exists():
@@ -305,15 +197,13 @@ def reconcile_manifest(df: pd.DataFrame) -> tuple[Check, list[dict]]:
         name="manifest_coverage", group="manifest", severity=SEVERITY_WARNING,
         description="DQ bắt được các lỗi đã inject trong manifest (coverage tối thiểu)",
         observed=round(worst_coverage, 4), threshold=0.99, comparator=">=",
-        passed=_evaluate(worst_coverage, ">=", 0.99),
+        passed=_EVAL[">="](worst_coverage, 0.99),
         detail={"per_type": per_type},
     )
     return check, per_type
 
 
-# ----------------------------------------------------------------------------
-# Run + report
-# ----------------------------------------------------------------------------
+# -- Run + report --
 def run_checks(checks: list[Check]) -> dict:
     errors_failed = [c for c in checks if not c.passed and c.severity == SEVERITY_ERROR]
     warnings_failed = [c for c in checks if not c.passed and c.severity == SEVERITY_WARNING]
@@ -345,28 +235,21 @@ def _top_error_codes(df: pd.DataFrame) -> list[dict]:
 def build_report(df: pd.DataFrame, checks: list[Check], verdict: dict, manifest_per_type: list[dict], run_id: str, bronze_total: int) -> dict:
     n = len(df)
     valid = int(df["_is_valid"].sum())
-    bucket_counts = {k: int(v) for k, v in df.loc[df["_dq_bucket"].fillna("") != "", "_dq_bucket"].value_counts().items()}
-    soft_orphans = {c: int(df[c].sum()) for c in ("_dq_fk_customer", "_dq_fk_account", "_dq_fk_merchant")}
-    silver_run_id = str(df["_dq_run_id"].iloc[0]) if n else None
+    buckets = {k: int(v) for k, v in df.loc[df["_dq_bucket"].fillna("") != "", "_dq_bucket"].value_counts().items()}
     return {
         "run_id": run_id,
-        "silver_run_id": silver_run_id,
+        "silver_run_id": str(df["_dq_run_id"].iloc[0]) if n else None,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "overall_status": verdict["overall_status"],
         "overall_passed": verdict["overall_passed"],
-        "totals": {
-            "bronze_rows": bronze_total,
-            "silver_rows": n,
-            "valid_rows": valid,
-            "invalid_rows": n - valid,
-            "valid_rate": round(valid / n, 6) if n else None,
-            "soft_orphan_rows": int(sum(soft_orphans.values())),
-        },
+        "totals": {"bronze_rows": bronze_total, "silver_rows": n, "valid_rows": valid,
+                   "invalid_rows": n - valid, "valid_rate": round(valid / n, 6) if n else None,
+                   "soft_orphan_rows": int(sum(df[c].sum() for c in ("_dq_fk_customer", "_dq_fk_account", "_dq_fk_merchant")))},
         "summary": {k: verdict[k] for k in ("total_checks", "passed", "failed_errors", "failed_warnings")},
-        "bucket_counts": dict(sorted(bucket_counts.items())),
+        "bucket_counts": dict(sorted(buckets.items())),
         "bucket_by_month": _bucket_by_month(df),
         "top_error_codes": _top_error_codes(df),
-        "soft_orphans": soft_orphans,
+        "soft_orphans": {c: int(df[c].sum()) for c in ("_dq_fk_customer", "_dq_fk_account", "_dq_fk_merchant")},
         "manifest_reconciliation": manifest_per_type,
         "checks": [asdict(c) for c in checks],
     }
@@ -380,68 +263,56 @@ def write_json_report(report: dict) -> Path:
     return path
 
 
-def _md_table(rows: list[list], headers: list[str]) -> str:
-    out = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
-    for r in rows:
-        out.append("| " + " | ".join(str(x) for x in r) + " |")
-    return "\n".join(out)
-
 
 def write_markdown_report(report: dict) -> Path:
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    t = report["totals"]
-    lines = [
-        "# Data Quality Report — Silver Transactions (Day 7)",
-        "",
-        f"- run_id: `{report['run_id']}` · silver_run_id: `{report['silver_run_id']}` · generated_at: {report['generated_at']}",
-        f"- **Overall: {report['overall_status']}** — {report['summary']['passed']}/{report['summary']['total_checks']} check PASS · "
-        f"{report['summary']['failed_errors']} ERROR · {report['summary']['failed_warnings']} WARNING",
-        "",
-        "## 1. Summary",
-        f"- Bronze rows: {t['bronze_rows']:,} → Silver rows: {t['silver_rows']:,} "
-        f"({'no row loss ✓' if t['bronze_rows'] == t['silver_rows'] else 'ROW LOSS ✗'})",
-        f"- Valid: {t['valid_rows']:,} ({t['valid_rate']*100:.2f}%) · Invalid (quarantine-bound): {t['invalid_rows']:,}",
-        f"- Soft orphan FK: {t['soft_orphan_rows']:,} → Unknown member (Day 9), không quarantine",
-        "",
-        "## 2. Integrity checks (ERROR)",
-        _md_table(
-            [[c["name"], c["observed"], c["comparator"] + " " + str(c["threshold"]), "PASS" if c["passed"] else "**FAIL**"]
-             for c in report["checks"] if c["group"] == "integrity"],
-            ["check", "observed", "threshold", "status"],
-        ),
-        "",
-        "## 3. Row-flag rates (WARNING)",
-        _md_table(
-            [[c["name"], f"{c['observed']*100:.3f}%", f"<= {c['threshold']*100:.2f}%" if c["comparator"] == "<=" else f">= {c['threshold']*100:.2f}%",
-              "PASS" if c["passed"] else "**WARN**"]
-             for c in report["checks"] if c["group"] == "row_flag"],
-            ["check", "observed", "threshold", "status"],
-        ),
-        "",
-        "## 4. Quarantine buckets",
-        _md_table([[k, f"{v:,}"] for k, v in report["bucket_counts"].items()], ["bucket", "count"]),
-        "",
-        "## 5. Top error codes (`_dq_errors`)",
-        _md_table([[r["code"], f"{r['count']:,}"] for r in report["top_error_codes"]], ["error_code", "count"]),
-        "",
-        "## 6. Manifest reconciliation",
-        _md_table(
-            [[r["error_type"], f"{r['manifest']:,}", f"{r['silver_flagged']:,}", f"{r['coverage']*100:.1f}%"]
-             for r in report["manifest_reconciliation"]],
-            ["error_type", "manifest", "silver_flagged", "coverage"],
-        ),
-        "",
-        f"## 7. Kết luận",
-        f"Đủ điều kiện sang Day 8 (quarantine split): **{'CÓ' if report['overall_passed'] else 'CHƯA — sửa ERROR trước'}**.",
-        "",
-    ]
+    t, s = report["totals"], report["summary"]
+    row_ok = "no row loss ✓" if t["bronze_rows"] == t["silver_rows"] else "ROW LOSS ✗"
+    go = "CÓ" if report["overall_passed"] else "CHƯA — sửa ERROR trước"
+
+    def _tbl(rows, headers): return "\n".join(["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"] + ["| " + " | ".join(str(x) for x in r) + " |" for r in rows])
+
+    integrity = [[c["name"], c["observed"], f"{c['comparator']} {c['threshold']}", "PASS" if c["passed"] else "**FAIL**"] for c in report["checks"] if c["group"] == "integrity"]
+    row_flags = [[c["name"], f"{c['observed']*100:.3f}%", f"{c['comparator']} {c['threshold']*100:.2f}%" if c["comparator"] in ("<=", ">=") else f"== {c['threshold']}", "PASS" if c["passed"] else "**WARN**"] for c in report["checks"] if c["group"] == "row_flag"]
+    buckets = [[k, f"{v:,}"] for k, v in report["bucket_counts"].items()]
+    errors = [[r["code"], f"{r['count']:,}"] for r in report["top_error_codes"]]
+    manifest = [[r["error_type"], f"{r['manifest']:,}", f"{r['silver_flagged']:,}", f"{r['coverage']*100:.1f}%"] for r in report["manifest_reconciliation"]]
+
+    md = f"""# Data Quality Report — Silver Transactions (Day 7)
+
+- run_id: `{report['run_id']}` · silver_run_id: `{report['silver_run_id']}` · generated_at: {report['generated_at']}
+- **Overall: {report['overall_status']}** — {s['passed']}/{s['total_checks']} check PASS · {s['failed_errors']} ERROR · {s['failed_warnings']} WARNING
+
+## 1. Summary
+- Bronze rows: {t['bronze_rows']:,} → Silver rows: {t['silver_rows']:,} ({row_ok})
+- Valid: {t['valid_rows']:,} ({t['valid_rate']*100:.2f}%) · Invalid (quarantine-bound): {t['invalid_rows']:,}
+- Soft orphan FK: {t['soft_orphan_rows']:,} → Unknown member (Day 9)
+
+## 2. Integrity checks (ERROR)
+{_tbl(integrity, ["check", "observed", "threshold", "status"])}
+
+## 3. Row-flag rates (WARNING)
+{_tbl(row_flags, ["check", "observed", "threshold", "status"])}
+
+## 4. Quarantine buckets
+{_tbl(buckets, ["bucket", "count"])}
+
+## 5. Top error codes (`_dq_errors`)
+{_tbl(errors, ["error_code", "count"])}
+
+## 6. Manifest reconciliation
+{_tbl(manifest, ["error_type", "manifest", "silver_flagged", "coverage"])}
+
+## 7. Kết luận
+Đủ điều kiện sang Day 8 (quarantine split): **{go}**.
+"""
     path = DOCS_DIR / "data_quality_report.md"
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text(md, encoding="utf-8")
     return path
 
 
 def run_quality_checks() -> dict:
-    """Entrypoint (Airflow gọi): load Silver -> build checks -> run -> ghi report -> trả report dict."""
+    """Entrypoint (Airflow-callable): load Silver → build checks → write reports."""
     run_id = make_run_id()
     log.info("quality checks start run_id=%s", run_id)
     cfg = GeneratorConfig()

@@ -1,13 +1,4 @@
-"""Day 9 — Build Gold star schema từ clean Silver.
-
-Dựng 6 dim + fact_transaction theo sql/star_schema.sql:
-- dim_date (generate), 4 dim SCD1 (account/merchant/device/location), dim_customer SCD2 (point-in-time).
-- Surrogate key *_sk; orphan FK -> Unknown member sk=-1 (grain §7); SCD2 join theo event_time (grain §6).
-- Join fraud_labels -> is_fraud/fraud_pattern.
-
-Engine = pandas (Day 15 sẽ port PySpark). fact point-in-time = pd.merge_asof. Output Parquet + (verify) DuckDB.
-Chạy: python -m src.transform.build_gold
-"""
+"""Build Gold star schema: 6 dims + fact_transaction from clean Silver."""
 
 import json
 import logging
@@ -19,14 +10,10 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SILVER_DIR = PROJECT_ROOT / "data" / "silver"
-BRONZE_DIR = PROJECT_ROOT / "data" / "bronze"
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-GOLD_DIR = PROJECT_ROOT / "data" / "gold"
-SQL_FILE = PROJECT_ROOT / "sql" / "star_schema.sql"
-LOG_DIR = PROJECT_ROOT / "logs"
+from src.paths import BRONZE_DIR, GOLD_DIR, LOG_DIR, RAW_DIR, SILVER_DIR, SQL_DIR
+
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+SQL_FILE = SQL_DIR / "star_schema.sql"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,7 +27,6 @@ DIM_DATE_START = date(2025, 12, 1)
 DIM_DATE_END = date(2026, 7, 31)
 PAYDAY_DAYS = {1, 2, 14, 15}
 DROP_LINEAGE = ["_ingested_at", "_source_file", "_source_system", "_batch_id"]
-# us-resolution sentinels (ns sẽ tràn ở 9999). clean.event_time là datetime64[us].
 VF_START = np.datetime64("1900-01-01T00:00:00", "us")
 VF_END = np.datetime64("9999-12-31T00:00:00", "us")
 
@@ -61,17 +47,20 @@ def reset_gold_dir(table: str) -> Path:
 
 
 def read_silver_dim(name: str) -> pd.DataFrame:
+    """Read Silver dimension, dropping Bronze lineage columns."""
     df = pd.read_parquet(SILVER_DIR / name / f"{name}.parquet")
     return df.drop(columns=[c for c in DROP_LINEAGE if c in df.columns])
 
 
 def add_surrogate_key(df: pd.DataFrame, sk_col: str, sort_cols: list[str]) -> pd.DataFrame:
+    """Sort by sort_cols, then assign sequential int keys 1..n."""
     df = df.sort_values(sort_cols).reset_index(drop=True)
     df.insert(0, sk_col, np.arange(1, len(df) + 1, dtype="int64"))
     return df
 
 
 def prepend_unknown(df: pd.DataFrame, sk_col: str, bkey_col: str, extra: dict | None = None) -> pd.DataFrame:
+    """Prepend an Unknown row with sk=-1."""
     row = {c: pd.NA for c in df.columns}
     row[sk_col] = UNKNOWN_SK
     row[bkey_col] = "UNKNOWN"
@@ -81,15 +70,14 @@ def prepend_unknown(df: pd.DataFrame, sk_col: str, bkey_col: str, extra: dict | 
 
 
 def write_gold(df: pd.DataFrame, table: str, file_stem: str) -> Path:
+    """Write DataFrame to data/gold/<table>/<file_stem>.parquet."""
     out = reset_gold_dir(table)
     path = out / f"{file_stem}.parquet"
     df.to_parquet(path, index=False)
     return path
 
 
-# ----------------------------------------------------------------------------
-# dim_date
-# ----------------------------------------------------------------------------
+# -- dim_date --
 def build_dim_date() -> pd.DataFrame:
     idx = pd.date_range(DIM_DATE_START, DIM_DATE_END, freq="D")
     df = pd.DataFrame({"full_date": idx.date})
@@ -107,18 +95,14 @@ def build_dim_date() -> pd.DataFrame:
                "day", "day_of_week", "day_name", "is_weekend", "is_payday"]]
 
 
-# ----------------------------------------------------------------------------
-# dim SCD1 (account / merchant / device / location)
-# ----------------------------------------------------------------------------
+# -- dim SCD1 (account / merchant / device / location) --
 def build_dim_scd1(name: str, sk_col: str, bkey_col: str, keep_cols: list[str]) -> pd.DataFrame:
     df = read_silver_dim(name)[keep_cols].drop_duplicates(subset=[bkey_col], keep="first")
     df = add_surrogate_key(df, sk_col, [bkey_col])
     return prepend_unknown(df, sk_col, bkey_col)
 
 
-# ----------------------------------------------------------------------------
-# dim_customer (SCD2 — backward undo từ snapshot cuối)
-# ----------------------------------------------------------------------------
+# -- dim_customer (SCD2 — backward undo from latest snapshot) --
 def load_scd_events() -> dict[str, list[dict]]:
     ev = pd.read_parquet(BRONZE_DIR / "raw_customer_scd_events" / "raw_customer_scd_events.parquet")
     ev = ev.drop(columns=[c for c in DROP_LINEAGE if c in ev.columns])
@@ -174,9 +158,7 @@ def build_dim_customer() -> pd.DataFrame:
                "home_city", "home_country", "risk_tier", "kyc_level", "valid_from", "valid_to", "is_current"]]
 
 
-# ----------------------------------------------------------------------------
-# fact_transaction
-# ----------------------------------------------------------------------------
+# -- fact_transaction --
 FACT_COLS = [
     "transaction_id", "date_key", "customer_sk", "account_sk", "merchant_sk", "device_sk", "location_sk",
     "channel", "transaction_type", "status", "currency", "fraud_pattern",
@@ -193,8 +175,7 @@ def sk_lookup(dim: pd.DataFrame, sk_col: str, bkey_col: str) -> dict:
 def load_fraud_labels() -> pd.DataFrame:
     fl = pd.read_csv(RAW_DIR / "fraud_labels.csv", usecols=["transaction_id", "is_fraud", "fraud_pattern"])
     fl["is_fraud"] = pd.to_numeric(fl["is_fraud"], errors="coerce").fillna(0).astype("int8")
-    # fraud_labels có 2M dòng (label_all_transactions) -> transaction_id BỊ TRÙNG ở các dòng duplicate
-    # (survivor + non-survivor cùng id). Dedupe để left-join 1:1 (tránh fan-out), ưu tiên is_fraud=1.
+    # Dedupe: duplicate txns share the same id; keep is_fraud=1 first.
     fl = fl.sort_values("is_fraud", ascending=False).drop_duplicates("transaction_id", keep="first")
     return fl
 
@@ -207,7 +188,7 @@ def build_fact_partition(clean: pd.DataFrame, *, cust_index: pd.DataFrame, acc_l
     part["device_sk"] = part["device_id"].map(dev_lk).fillna(UNKNOWN_SK).astype("int64")
     part["location_sk"] = part["location_id"].map(loc_lk).fillna(UNKNOWN_SK).astype("int64")
 
-    # customer_sk: point-in-time SCD2 join (version có valid_from <= event_time gần nhất)
+    # Point-in-time SCD2 join: version with valid_from <= event_time
     part = part.sort_values("event_time")
     merged = pd.merge_asof(part, cust_index, left_on="event_time", right_on="valid_from",
                            by="customer_id", direction="backward")
@@ -241,9 +222,7 @@ def build_fact(dim_customer: pd.DataFrame, dims: dict, run_id: str) -> dict:
     return {"fact_rows": total}
 
 
-# ----------------------------------------------------------------------------
-# Verify (gồm load DuckDB FK enforce)
-# ----------------------------------------------------------------------------
+# -- Verify + DuckDB load --
 def _gold_count(table: str, stem_glob: str) -> int:
     return sum(pq.read_metadata(p).num_rows for p in (GOLD_DIR / table).glob(stem_glob))
 
@@ -257,13 +236,12 @@ def verify(dim_customer: pd.DataFrame, dims: dict, dim_date: pd.DataFrame) -> li
     fact_rows = _gold_count("fact_transaction", "fact_transaction_*.parquet")
     add("fact_rowcount_eq_clean", fact_rows == CLEAN_ROWS_EXPECTED, {"fact": fact_rows, "expected": CLEAN_ROWS_EXPECTED})
 
+    fact_cols = ["transaction_id", "date_key", "customer_sk", "account_sk", "merchant_sk", "device_sk", "location_sk", "is_fraud", "fraud_pattern", "amount_vnd"]
     fact = pd.concat(
-        [pd.read_parquet(p, columns=["transaction_id", "date_key", "customer_sk", "account_sk", "merchant_sk", "device_sk", "location_sk", "is_fraud", "fraud_pattern", "amount_vnd"])
-         for p in (GOLD_DIR / "fact_transaction").glob("*.parquet")],
+        [pd.read_parquet(p, columns=fact_cols) for p in (GOLD_DIR / "fact_transaction").glob("*.parquet")],
         ignore_index=True,
     )
 
-    # no NULL sk + mọi sk resolve về dim (gồm -1)
     sk_map = {"customer_sk": dim_customer, "account_sk": dims["account"], "merchant_sk": dims["merchant"], "device_sk": dims["device"], "location_sk": dims["location"]}
     null_sk = {c: int(fact[c].isna().sum()) for c in [*sk_map, "date_key"]}
     add("no_null_sk", all(v == 0 for v in null_sk.values()), null_sk)
@@ -293,20 +271,19 @@ def verify(dim_customer: pd.DataFrame, dims: dict, dim_date: pd.DataFrame) -> li
     clean_sum = sum(pd.read_parquet(p, columns=["amount_vnd"])["amount_vnd"].sum() for p in (SILVER_DIR / "clean_transactions").glob("*.parquet"))
     add("amount_vnd_sum_conserved", abs(fact["amount_vnd"].sum() - clean_sum) < 1.0, {"fact": float(fact["amount_vnd"].sum()), "clean": float(clean_sum)})
 
-    # unknown usage
     add("unknown_usage", True, {sk: int((fact[sk] == UNKNOWN_SK).sum()) for sk in sk_map})
 
     return checks
 
 
 def load_into_duckdb() -> dict:
-    """Load Gold parquet vào DuckDB qua star_schema.sql -> FK enforce. Lỗi FK -> raise -> fail."""
+    """Load Gold Parquet into DuckDB via star_schema.sql → FK enforcement."""
     import duckdb
     db = GOLD_DIR / "gold.duckdb"
     if db.exists():
         db.unlink()
     con = duckdb.connect(str(db))
-    con.execute(SQL_FILE.read_text(encoding="utf-8"))  # tạo bảng + INSERT Unknown sk=-1
+    con.execute(SQL_FILE.read_text(encoding="utf-8"))
     dim_specs = [
         ("dim_date", "dim_date/dim_date.parquet", None),
         ("dim_customer", "dim_customer/dim_customer.parquet", "customer_sk"),
@@ -316,7 +293,7 @@ def load_into_duckdb() -> dict:
         ("dim_location", "dim_location/dim_location.parquet", "location_sk"),
     ]
     for table, rel, sk in dim_specs:
-        where = f"WHERE {sk} <> {UNKNOWN_SK}" if sk else ""  # tránh trùng Unknown DDL đã insert
+        where = f"WHERE {sk} <> {UNKNOWN_SK}" if sk else ""
         con.execute(f"INSERT INTO {table} SELECT * FROM read_parquet('{(GOLD_DIR / rel).as_posix()}') {where}")
     con.execute(f"INSERT INTO fact_transaction SELECT * FROM read_parquet('{(GOLD_DIR / 'fact_transaction' / '*.parquet').as_posix()}')")
     counts = {t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t, _, _ in dim_specs}
@@ -355,7 +332,7 @@ def main() -> None:
     try:
         summary["duckdb_load"] = load_into_duckdb()
         checks.append({"name": "duckdb_fk_enforce", "passed": True, "detail": summary["duckdb_load"]})
-    except Exception as e:  # FK violation -> DuckDB raise
+    except Exception as e:
         checks.append({"name": "duckdb_fk_enforce", "passed": False, "detail": str(e).splitlines()[0][:200]})
 
     summary["verification"] = checks

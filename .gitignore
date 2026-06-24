@@ -33,6 +33,13 @@ data/silver/
 data/gold/
 data/quarantine/
 data/quality/
+data/bad_data_samples/
+logs/
+data/bronze/
+data/silver/
+data/gold/
+data/quarantine/
+data/quality/
 data/smoke/
 data/external/*
 !data/external/.gitkeep
