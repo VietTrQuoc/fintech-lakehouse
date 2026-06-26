@@ -108,7 +108,7 @@ def transform_transactions_partition(
     city = df["city"].astype(str).str.strip()
     location_id = df["location_id"].astype(str).str.strip()
 
-    event_ts = pd.to_datetime(df["transaction_time"], errors="coerce")
+    event_ts = pd.to_datetime(df["transaction_time"], errors="coerce")  
     ingest_ts = pd.to_datetime(df["ingestion_time"], errors="coerce")
     source_row_number = pd.to_numeric(df["source_row_number"], errors="coerce").astype("Int64")
 
